@@ -10,6 +10,8 @@ import VendorCTA from '@/components/home/VendorCTA'
 import DownloadAppCTA from '@/components/home/DownloadAppCTA'
 import NewsletterCTA from '@/components/home/NewsletterCTA'
 
+export const dynamic = 'force-dynamic'
+
 export const metadata: Metadata = {
   title: 'LunchUp - Order Food from Restaurants Near You',
   description:

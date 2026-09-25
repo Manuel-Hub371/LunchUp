@@ -1,17 +1,17 @@
 /**
- * Authored in the browser for the development build. An order is the
- * authoritative contract produced by the order service, never by the UI.
+ * Order service — create and retrieve orders through the LunchUp API.
+ *
+ * Before an order is created the local cart is synchronized onto the server
+ * cart (items/quantities/instructions reconciled, one restaurant per cart),
+ * then `POST /orders` is sent and the server is authoritative for pricing,
+ * availability and coupon validation.
  */
-import { withLatency, ApiError } from '@/lib/services/api'
-import { getFoodById, getRestaurantById, DELIVERY_METHODS } from '@/lib/mock-data'
-import { getDeliveryMinutes, roundPrice, uid } from '@/lib/utils'
+import { apiRequest, ApiError, request } from '@/lib/services/api'
 import type {
   CartLine,
-  CartSelection,
   DeliveryAddress,
   DeliveryMethod,
   Order,
-  OrderItem,
   OrderStatus,
   OrderTimelineEntry,
   PaymentMethod,
@@ -24,73 +24,229 @@ export interface CreateOrderInput {
   paymentMethod: PaymentMethod
   couponDiscount?: number
   couponLabel?: string
+  couponCode?: string
 }
 
-/** Delivery options surfaced at checkout. */
-export const deliveryMethods = DELIVERY_METHODS
+/** Delivery options surfaced at checkout (fees mirror the backend). */
+export const deliveryMethods: { id: DeliveryMethod; label: string; eta: string; fee: number; description: string }[] = [
+  { id: 'standard', label: 'Standard Delivery', eta: '30–45 min', fee: 10, description: 'Doorstep delivery' },
+  { id: 'express', label: 'Express Delivery', eta: '20–30 min', fee: 18, description: 'Prioritised dispatch' },
+]
 
-function deliveryFeeFor(method: DeliveryMethod): number {
-  const option = DELIVERY_METHODS.find((item) => item.id === method)
-  return option?.fee ?? DELIVERY_METHODS[0].fee
+export interface OrderViewItem {
+  foodId: string
+  foodName: string
+  vendorId: string
+  vendorName: string
+  image: string | null
+  quantity: number
+  unitPrice: number
+  lineTotal: number
+  selections: { groupName: string; optionNames: string[]; priceModifier: number }[]
+  specialInstructions?: string
 }
 
-function moduleFood(foodId: string) {
-  return getFoodById(foodId)
+export interface OrderView {
+  id: string
+  number: string
+  status: string
+  statusRaw?: string
+  paymentStatus: string
+  items: OrderViewItem[]
+  subtotal: number
+  deliveryFee: number
+  discount: number
+  total: number
+  couponCode?: string | null
+  couponLabel?: string | null
+  deliveryMethod: 'standard' | 'express'
+  paymentMethod: PaymentMethod
+  deliveryAddress: {
+    name: string
+    phone: string
+    address?: string | null
+    landmark?: string | null
+    city: string
+    instructions?: string | null
+  }
+  estimatedDeliveryTime?: string
+  createdAt: string
+  paymentId?: string
+  payment?: { reference: string | null; accountMasked: string | null } | null
+  timeline: { status: string; label: string; timestamp: string }[]
 }
 
-function validateSelections(foodId: string, selections: CartSelection[], quantity: number) {
-  const food = moduleFood(foodId)
-  if (!food) throw new ApiError(`One of the items in your cart is no longer available.`, 422)
-  if (food.available === false) throw new ApiError(`${food.name} is currently unavailable.`, 422)
+function toDeliveryAddress(address: OrderView['deliveryAddress']): DeliveryAddress {
+  return {
+    name: address.name,
+    phone: address.phone,
+    address: address.address ?? '',
+    landmark: address.landmark ?? undefined,
+    city: address.city,
+    instructions: address.instructions ?? undefined,
+  }
+}
 
-  for (const selection of selections) {
-    const group = food.customizationGroups?.find((g) => g.id === selection.groupId)
-    if (!group) throw new ApiError(`${food.name}: a selected option is no longer offered.`, 422)
-    for (const optionId of selection.optionIds) {
-      const option = group.options.find((o) => o.id === optionId)
-      if (!option || option.available === false) {
-        throw new ApiError(`${food.name}: a selected option is no longer offered.`, 422)
+export function toOrder(view: OrderView): Order {
+  return {
+    id: view.id,
+    number: view.number,
+    status: view.status as OrderStatus,
+    paymentStatus: view.paymentStatus as Order['paymentStatus'],
+    items: (view.items || []).map((item) => ({
+      foodId: item.foodId,
+      foodName: item.foodName,
+      vendorId: item.vendorId,
+      vendorName: item.vendorName,
+      image: item.image ?? '',
+      quantity: item.quantity,
+      unitPrice: item.unitPrice,
+      lineTotal: item.lineTotal,
+      selections: item.selections || [],
+      specialInstructions: item.specialInstructions,
+    })),
+    subtotal: view.subtotal,
+    deliveryFee: view.deliveryFee,
+    discount: view.discount,
+    total: view.total,
+    deliveryMethod: view.deliveryMethod,
+    paymentMethod: view.paymentMethod,
+    deliveryAddress: toDeliveryAddress(view.deliveryAddress),
+    estimatedDeliveryTime: view.estimatedDeliveryTime || '',
+    createdAt: view.createdAt,
+    paymentId: view.paymentId,
+    paymentReference: view.payment?.reference ?? undefined,
+    timeline: (view.timeline || []).map((entry) => ({
+      status: entry.status as OrderStatus,
+      label: entry.label,
+      timestamp: entry.timestamp,
+    })),
+  }
+}
+
+interface CartLineView {
+  key: string
+  itemId: string
+  food: { id: string }
+  quantity: number
+  selections: { groupId: string; optionIds: string[] }[]
+  specialInstructions?: string
+}
+
+interface CartView {
+  items: CartLineView[]
+}
+
+function selectionSignature(selections: { groupId: string; optionIds: string[] }[]): string {
+  return JSON.stringify(
+    [...selections]
+      .sort((a, b) => a.groupId.localeCompare(b.groupId))
+      .map((s) => ({ groupId: s.groupId, optionIds: [...s.optionIds].sort() }))
+  )
+}
+
+function matchesCartLine(local: CartLine, server: CartLineView): boolean {
+  if (local.food.id !== server.food.id) return false
+  return selectionSignature(local.selections) === selectionSignature(server.selections || [])
+}
+
+/** Reconciles the local cart onto the server cart before ordering. */
+async function syncCart(lines: CartLine[]): Promise<void> {
+  let envelope: Awaited<ReturnType<typeof apiRequest<CartView>>>
+  try {
+    envelope = await apiRequest<CartView>('/cart')
+  } catch (error) {
+    throw wrapApiError(error, 'Please sign in before placing your order.')
+  }
+
+  const serverItems = envelope.data?.items || []
+  const matchedServer = new Set<string>()
+
+  for (const line of lines) {
+    const serverItem = serverItems.find((item) => matchesCartLine(line, item))
+    if (serverItem) {
+      matchedServer.add(serverItem.itemId)
+      try {
+        await apiRequest<CartView>(`/cart/items/${encodeURIComponent(serverItem.itemId)}`, {
+          method: 'PATCH',
+          body: {
+            quantity: line.quantity,
+            specialInstructions: line.specialInstructions,
+          },
+        })
+      } catch (error) {
+        throw wrapApiError(error, 'We could not update your cart. Please try again.')
+      }
+    } else {
+      try {
+        await apiRequest<CartView>('/cart/items', {
+          method: 'POST',
+          body: {
+            foodId: line.food.id,
+            quantity: line.quantity,
+            selections: line.selections.map((s) => ({ groupId: s.groupId, optionIds: s.optionIds })),
+            specialInstructions: line.specialInstructions,
+          },
+        })
+      } catch (error) {
+        throw wrapApiError(error, 'We could not add all of your items. Please try again.')
       }
     }
   }
 
-  if (!Number.isInteger(quantity) || quantity < 1 || quantity > 50) {
-    throw new ApiError(`Invalid quantity for ${food.name}.`, 422)
+  for (const serverItem of serverItems) {
+    if (matchedServer.has(serverItem.itemId)) continue
+    try {
+      await apiRequest<CartView>(`/cart/items/${encodeURIComponent(serverItem.itemId)}`, {
+        method: 'DELETE',
+      })
+    } catch {
+      /* best effort — a stray server line must not block ordering */
+    }
   }
 }
 
-const ORDER_STORAGE_KEY = 'lunchup.orders.v1'
-
-function readOrders(): Order[] {
-  try {
-    const raw = localStorage.getItem(ORDER_STORAGE_KEY)
-    return raw ? (JSON.parse(raw) as Order[]) : []
-  } catch {
-    return []
-  }
-}
-
-function writeOrders(orders: Order[]): void {
-  try {
-    localStorage.setItem(ORDER_STORAGE_KEY, JSON.stringify(orders))
-  } catch {
-    /* storage unavailable */
-  }
+function wrapApiError(error: unknown, fallback: string): ApiError {
+  if (error instanceof ApiError && error.status > 0) return error
+  return new ApiError(fallback, 0, 'CART_SYNC_FAILED')
 }
 
 function buildTimeline(status: OrderStatus, label: string): OrderTimelineEntry[] {
   return [{ status, label, timestamp: new Date().toISOString() }]
 }
 
+/** Minimal order assembled from the public track endpoint. */
+function orderFromTimeline(orderId: string, timeline: OrderTimelineEntry[]): Order {
+  const latest = timeline[timeline.length - 1]
+  return {
+    id: orderId,
+    number: orderId,
+    status: latest?.status ?? 'pending',
+    paymentStatus: 'pending',
+    items: [],
+    subtotal: 0,
+    deliveryFee: 0,
+    discount: 0,
+    total: 0,
+    deliveryMethod: 'standard',
+    paymentMethod: 'pay_on_delivery',
+    deliveryAddress: { name: '', phone: '', address: '', city: '' },
+    estimatedDeliveryTime: '',
+    createdAt: latest?.timestamp ?? new Date().toISOString(),
+    timeline,
+  }
+}
+
 export const orderService = {
+  deliveryFeeFor(method: DeliveryMethod): number {
+    return deliveryMethods.find((item) => item.id === method)?.fee ?? deliveryMethods[0].fee
+  },
+
   /**
-   * Creates an order and recomputes every amount from authoritative data:
-   * food base price, valid modifiers, quantity, delivery fee, coupon and
-   * final total. Browser-provided prices are never trusted.
+   * Creates an order. The server prices every amount from the cart; the
+   * browser only supplies the delivery intent and payment preference.
    */
   async createOrder(input: CreateOrderInput): Promise<Order> {
-    await withLatency(null)
-
     if (!input.lines.length) {
       throw new ApiError('Your cart is empty.', 422)
     }
@@ -101,161 +257,82 @@ export const orderService = {
       throw new ApiError('A delivery phone number is required.', 422)
     }
 
-    const items: OrderItem[] = []
-    let subtotal = 0
+    await syncCart(input.lines)
 
-    for (const line of input.lines) {
-      validateSelections(line.food.id, line.selections, line.quantity)
-      const food = moduleFood(line.food.id) as NonNullable<ReturnType<typeof moduleFood>>
-      const vendor = getRestaurantById(food.vendorId)
-      if (!vendor || vendor.isOpen === false) {
-        throw new ApiError(`${food.vendor} is not available for orders right now.`, 409)
-      }
-
-      let unitPrice = food.discount && food.discount > 0
-        ? Math.round(food.price * (1 - food.discount / 100))
-        : food.price
-
-      const selectionsSummary: OrderItem['selections'] = []
-      for (const selection of line.selections) {
-        const group = food.customizationGroups?.find((g) => g.id === selection.groupId)
-        if (!group) continue
-        const optionNames: string[] = []
-        let modifier = 0
-        for (const optionId of selection.optionIds) {
-          const option = group.options.find((o) => o.id === optionId)
-          if (option) {
-            optionNames.push(option.name)
-            modifier += option.priceModifier
-          }
-        }
-        if (optionNames.length) {
-          selectionsSummary.push({ groupName: group.name, optionNames, priceModifier: modifier })
-          unitPrice += modifier
-        }
-      }
-
-      unitPrice = roundPrice(unitPrice)
-      items.push({
-        foodId: food.id,
-        foodName: food.name,
-        vendorId: food.vendorId,
-        vendorName: food.vendor,
-        image: food.image,
-        quantity: line.quantity,
-        unitPrice,
-        lineTotal: roundPrice(unitPrice * line.quantity),
-        selections: selectionsSummary,
-        specialInstructions: line.specialInstructions,
-      })
-      subtotal += unitPrice * line.quantity
-    }
-
-    subtotal = roundPrice(subtotal)
-    const deliveryFee = deliveryFeeFor(input.deliveryMethod)
-    const discount = Math.max(0, input.couponDiscount || 0)
-    const total = roundPrice(subtotal + deliveryFee - discount)
-
-    const vendor = getRestaurantById(items[0].vendorId)
-    const etaMinutes = (vendor ? getDeliveryMinutes(vendor.deliveryTime) : 30) + 5
-    const eta = `${etaMinutes}-${etaMinutes + 10} min`
-
-    const order: Order = {
-      id: uid('order'),
-      number: this.newOrderNumber(),
-      status: 'pending',
-      paymentStatus: input.paymentMethod === 'pay_on_delivery' ? 'success' : 'pending',
-      items,
-      subtotal,
-      deliveryFee,
-      discount,
-      total,
-      deliveryMethod: input.deliveryMethod,
-      paymentMethod: input.paymentMethod,
-      deliveryAddress: input.deliveryAddress,
-      estimatedDeliveryTime: eta,
-      createdAt: new Date().toISOString(),
-      timeline: buildTimeline('pending', 'Order received'),
-    }
-
-    const orders = readOrders()
-    orders.unshift(order)
-    writeOrders(orders)
-    return order
+    const view = await request<OrderView>('/orders', {
+      method: 'POST',
+      body: {
+        deliveryAddress: {
+          name: input.deliveryAddress.name,
+          phone: input.deliveryAddress.phone,
+          address: input.deliveryAddress.address,
+          landmark: input.deliveryAddress.landmark,
+          city: input.deliveryAddress.city,
+          instructions: input.deliveryAddress.instructions,
+        },
+        deliveryMethod: input.deliveryMethod,
+        paymentMethod: input.paymentMethod,
+        couponCode: input.couponCode,
+      },
+    })
+    return toOrder(view)
   },
 
   newOrderNumber(): string {
     return `LU-${Date.now().toString(36).toUpperCase()}`
   },
 
+  /**
+   * Fetches an order by id. Prefers the authenticated detail endpoint; falls
+   * back to the public track endpoint to reconstruct a minimal order.
+   */
   async getById(orderId: string): Promise<Order | null> {
-    await withLatency(null)
-    return readOrders().find((order) => order.id === orderId || order.number === orderId) || null
-  },
-
-  async attachPayment(orderId: string, paymentId: string): Promise<Order | null> {
-    await withLatency(null)
-    const orders = readOrders()
-    const order = orders.find((item) => item.id === orderId)
-    if (!order) return null
-    order.paymentId = paymentId
-    writeOrders(orders)
-    return order
-  },
-
-  /** Advancing an order — called by the payment service after verification. */
-  async confirmOrder(orderId: string): Promise<Order | null> {
-    await withLatency(null)
-    const orders = readOrders()
-    const order = orders.find((item) => item.id === orderId)
-    if (!order) return null
-    order.status = 'confirmed'
-    order.paymentStatus = 'success'
-    order.timeline = [
-      ...order.timeline,
-      { status: 'confirmed', label: 'Order confirmed', timestamp: new Date().toISOString() },
-    ]
-    writeOrders(orders)
-    return order
-  },
-
-  async markCancelled(orderId: string): Promise<Order | null> {
-    await withLatency(null)
-    const orders = readOrders()
-    const order = orders.find((item) => item.id === orderId)
-    if (!order) return null
-    order.status = 'cancelled'
-    order.timeline = [
-      ...order.timeline,
-      { status: 'cancelled', label: 'Order cancelled', timestamp: new Date().toISOString() },
-    ]
-    writeOrders(orders)
-    return order
-  },
-
-  /** Development-only: advances a confirmed order for tracking demos. */
-  async simulateOrderProgress(orderId: string): Promise<Order | null> {
-    await withLatency(null)
-    const orders = readOrders()
-    const order = orders.find((item) => item.id === orderId)
-    if (!order) return null
-    const sequence: { status: OrderStatus; label: string }[] = [
-      { status: 'confirmed', label: 'Order confirmed' },
-      { status: 'preparing', label: 'Preparing your meal' },
-      { status: 'ready', label: 'Ready for pickup' },
-      { status: 'out_for_delivery', label: 'Out for delivery' },
-      { status: 'delivered', label: 'Delivered' },
-    ]
-    const currentIndex = sequence.findIndex((entry) => entry.status === order.status)
-    const next = sequence[currentIndex + 1]
-    if (next) {
-      order.status = next.status
-      order.timeline = [
-        ...order.timeline,
-        { status: next.status, label: next.label, timestamp: new Date().toISOString() },
-      ]
-      writeOrders(orders)
+    if (!orderId) return null
+    try {
+      const view = await request<OrderView>(`/orders/${encodeURIComponent(orderId)}`)
+      return toOrder(view)
+    } catch (error) {
+      if (error instanceof ApiError && (error.status === 401 || error.status === 404)) {
+        try {
+          const timeline = await request<OrderTimelineEntry[]>(
+            `/orders/${encodeURIComponent(orderId)}/track`
+          )
+          if (!timeline?.length) return null
+          return orderFromTimeline(orderId, timeline)
+        } catch {
+          return null
+        }
+      }
+      return null
     }
-    return order
+  },
+
+  /** Kept for compatibility — payment confirmation now refreshes from the API. */
+  async attachPayment(orderId: string, _paymentId: string): Promise<Order | null> {
+    return this.getById(orderId)
+  },
+
+  /** Advancing an order — the payment service refreshes status from the API. */
+  async confirmOrder(orderId: string): Promise<Order | null> {
+    return this.getById(orderId)
+  },
+
+  /** Customer-initiated cancellation via the API. */
+  async markCancelled(orderId: string): Promise<Order | null> {
+    try {
+      await request<{ message: string }>(`/orders/${encodeURIComponent(orderId)}/cancel`, {
+        method: 'POST',
+      })
+    } catch {
+      return null
+    }
+    return this.getById(orderId)
+  },
+
+  /** Development-only: server drives progress; this just refreshes state. */
+  async simulateOrderProgress(orderId: string): Promise<Order | null> {
+    return this.getById(orderId)
   },
 }
+
+export { buildTimeline }

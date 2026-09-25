@@ -2,10 +2,13 @@ import React from 'react'
 import Link from 'next/link'
 import { ArrowRight, Zap } from 'lucide-react'
 import FoodCard from '../cards/FoodCard'
-import { getDealFoods } from '@/lib/mock-data'
+import { foodService } from '@/lib/services/food.service'
 
-export default function TodayDeals() {
-  const dealFoods = getDealFoods().slice(0, 4)
+export default async function TodayDeals() {
+  const dealFoods = await foodService
+    .list({ dealsOnly: true, sort: 'popular', pageSize: 4 })
+    .then(({ items }) => items.slice(0, 4))
+    .catch(() => [])
 
   if (dealFoods.length === 0) return null
 

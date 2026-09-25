@@ -1,9 +1,37 @@
 /**
  * Coupon service — validates promo codes against defined offers.
+ *
+ * Coupons are validated authoritatively by the LunchUp API at order
+ * creation; this module mirrors the seeded offer catalog so checkout can
+ * preview a discount before submitting the order.
  */
-import { withLatency } from './api'
-import { coupons } from '@/lib/mock-data'
 import type { Coupon } from '@/types'
+
+export const coupons: Coupon[] = [
+  {
+    code: 'LUNCH10',
+    type: 'percent',
+    value: 10,
+    minSubtotal: 50,
+    maxDiscount: 25,
+    label: '10% off orders over GH₵50',
+  },
+  {
+    code: 'FIRST20',
+    type: 'percent',
+    value: 20,
+    minSubtotal: 30,
+    maxDiscount: 30,
+    label: '20% off your first order',
+  },
+  {
+    code: 'FREEDEL',
+    type: 'fixed',
+    value: 10,
+    minSubtotal: 80,
+    label: 'Free delivery on orders over GH₵80',
+  },
+]
 
 export interface CouponApplication {
   code: string
@@ -18,7 +46,6 @@ export type CouponLookupResult =
 
 export const couponService = {
   async validate(code: string, subtotal: number): Promise<CouponLookupResult> {
-    await withLatency(null)
     const normalized = code.trim().toUpperCase()
     const coupon = coupons.find((item) => item.code.toUpperCase() === normalized)
     if (!coupon) return { status: 'invalid' }
@@ -30,7 +57,7 @@ export const couponService = {
     }
     return {
       status: 'valid',
-      coupon: { code, label: coupon.label, discount: this.discountFor(coupon, subtotal) },
+      coupon: { code: coupon.code, label: coupon.label, discount: this.discountFor(coupon, subtotal) },
     }
   },
 

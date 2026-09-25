@@ -19,9 +19,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [hydrated, setHydrated] = useState(false)
 
   useEffect(() => {
-    authService.ensureDemoAccount()
+    let active = true
+    // Instant render from the cached user…
     setSession(authService.getSession())
     setHydrated(true)
+    // …then confirm the cookie session is still valid (or clear it).
+    void authService.fetchSession().then((fresh) => {
+      if (active) setSession(fresh)
+    })
+    return () => {
+      active = false
+    }
   }, [])
 
   const value = useMemo<AuthContextValue>(() => {
@@ -42,7 +50,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       login,
       register,
       logout: () => {
-        authService.logout()
+        void authService.logout()
         setSession(null)
       },
     }

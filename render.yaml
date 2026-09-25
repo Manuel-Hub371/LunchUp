@@ -1,0 +1,104 @@
+# ======================================================================
+# LunchUp — Render Blueprint
+#
+# Two separate services (backend API + Next.js frontend), each deployed
+# independently. The frontend rewrites /api/v1/* to the API service (see
+# frontend/website/next.config.js) so auth cookies stay same-origin.
+#
+# URLs after create:
+#   backend  -> https://lunchup-api.onrender.com
+#   frontend -> https://lunchup-frontend.onrender.com
+#
+# FIRST DEPLOY:
+#   1. Push this repo to GitHub, then in Render: "New Blueprint" -> pick
+#      the LunchUp repo. Both services below are created automatically.
+#   2. Set DATABASE_URL and (recommended) the JWT secrets / CLOUDINARY_URL:
+#        Render Dashboard -> lunchup-api -> Environment -> Edit
+#      - DATABASE_URL: any PostgreSQL connection string
+#        (e.g. your host, a Render managed Postgres, or Neon).
+#      - JWT_ACCESS_SECRET / JWT_REFRESH_SECRET: long random strings.
+#        OpenID note: the app works with placeholder secrets, but set real
+#        ones before going live.
+#   3. Re-deploy lunchup-api once the env vars are set (migrations run in
+#      the build step: prisma migrate deploy).
+# ======================================================================
+services:
+  # ------------------------------------------------------------------
+  # Backend — LunchUp API (NestJS + Prisma + PostgreSQL)
+  # ------------------------------------------------------------------
+  - type: web
+    name: lunchup-api
+    runtime: node
+    plan: free
+    rootDir: backend
+    healthCheckPath: /api/v1/health
+    branch: main
+    autoDeploy: true
+    buildCommand: npm install && npx prisma generate && npx prisma migrate deploy && npm run build
+    startCommand: npm run start:prod
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "20"
+      - key: API_URL
+        value: https://lunchup-api.onrender.com
+      - key: FRONTEND_URL
+        value: https://lunchup-frontend.onrender.com
+      - key: LOG_LEVEL
+        value: info
+      # Render injects PORT automatically; start:prod (node dist/main) uses it.
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_ACCESS_SECRET
+        sync: false
+      - key: JWT_REFRESH_SECRET
+        sync: false
+      - key: CLOUDINARY_URL
+        sync: false
+
+  # ------------------------------------------------------------------
+  # Frontend — LunchUp website (Next.js)
+  # ------------------------------------------------------------------
+  - type: web
+    name: lunchup-frontend
+    runtime: node
+    plan: free
+    rootDir: frontend/website
+    healthCheckPath: /
+    branch: main
+    autoDeploy: true
+    buildCommand: npm install && npm run build
+    startCommand: npm run start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "20"
+      # All /api/v1/* requests are proxied to the API service.
+      # NEXT_PUBLIC_API_URL is intentionally left unset so the browser and
+      # server both use the same-origin rewrite — this keeps the auth
+      # cookies (lunchup_access) same-origin.
+      - key: API_PROXY_TARGET
+        value: https://lunchup-api.onrender.com
+
+# ----------------------------------------------------------------------
+# Optional managed PostgreSQL (paid plan on Render). To use it, uncomment
+# the block below, enable it in the blueprint, and set the injected
+# internal database URL to DATABASE_URL (dashboard -> lunchup-api -> env):
+#   sync: false can be replaced with:
+#     - key: DATABASE_URL
+#       fromDatabase:
+#         name: lunchup-db
+#         property: connectionString
+#     - key: DIRECT_URL
+#       fromDatabase:
+#         name: lunchup-db
+#         property: connectionString
+# ----------------------------------------------------------------------
+# databases:
+#   - name: lunchup-db
+#     plan: starter
+#     databaseName: lunchup
+#     user: lunchup
+#     ipAllowList: []

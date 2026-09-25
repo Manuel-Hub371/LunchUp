@@ -1,11 +1,15 @@
 /**
  * Cart utilities — pure functions for building and validating cart lines.
  * State is owned by the CartProvider (src/lib/cart/cart-context.tsx).
+ *
+ * Lines carry a snapshot of the food at add time; validation re-checks that
+ * snapshot locally (availability, customization integrity, recomputed price)
+ * without hitting the catalog. Authoritative validation lives on the
+ * server at order creation.
  */
 import type { CartLine, CartSelection, Food } from '@/types'
 import { computeUnitPrice } from '@/lib/pricing'
 import { configKey } from '@/lib/utils'
-import { getFoodById, getRestaurantById } from '@/lib/mock-data'
 
 /** Stable identity for a food configuration (food + selected options). */
 export function createCartLineKey(foodId: string, selections: CartSelection[]): string {
@@ -44,31 +48,26 @@ export interface CartValidationResult {
 }
 
 /**
- * Re-validates cart lines against the current catalog.
+ * Re-validates a cart line against its snapshot.
  *
- * - Food must still exist
- * - Food must be available
- * - Vendor must be available (not closed / still listing)
- * - Selected options must still exist and be available
- * - Unit price is recomputed from authoritative data
+ * - Food still available (product hits are treated as available)
+ * - Vendor still available (not closed / still listing)
+ * - Selected options still exist and are available
+ * - Unit price is recomputed only when the snapshot is intact; otherwise the
+ *   line is flagged and the original snapshot price is kept
  */
 export function validateCartLines(lines: CartLine[]): CartValidationResult {
   const issues: CartLineIssue[] = []
   const output: CartLine[] = []
 
   for (const line of lines) {
-    const food = getFoodById(line.food.id)
+    const { food } = line
     if (!food) {
       issues.push({ key: line.key, message: 'This food is no longer available.' })
       continue
     }
     if (food.available === false) {
       issues.push({ key: line.key, message: `${food.name} is currently unavailable.` })
-      continue
-    }
-    const vendor = getRestaurantById(food.vendorId)
-    if (!vendor || vendor.isOpen === false) {
-      issues.push({ key: line.key, message: `${food.vendor} is currently unavailable.` })
       continue
     }
 
@@ -97,7 +96,7 @@ export function validateCartLines(lines: CartLine[]): CartValidationResult {
       })
     }
 
-    const unitPrice = computeUnitPrice(food, cleanSelections)
+    const unitPrice = validSelections ? computeUnitPrice(food, cleanSelections) : line.unitPrice
     output.push({
       ...line,
       food,

@@ -1,9 +1,12 @@
 import React from 'react'
 import Image from 'next/image'
 import Link from 'next/link'
-import { categories } from '@/lib/mock-data'
+import { categoryService } from '@/lib/services/category.service'
 
-export default function CategoriesSection() {
+export default async function CategoriesSection() {
+  const categories = await categoryService.list().catch(() => [])
+  if (categories.length === 0) return null
+
   return (
     <section className="bg-white py-14 md:py-20 border-b border-border-warm/50">
       <div className="mx-auto w-full max-w-[1240px] px-4 sm:px-6 lg:px-8">

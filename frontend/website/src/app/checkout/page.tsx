@@ -25,8 +25,27 @@ import { validateCartLines } from '@/lib/cart/cart-utils'
 import { orderService, deliveryMethods } from '@/lib/orders/order.service'
 import { paymentService } from '@/lib/payments/payment.service'
 import { couponService } from '@/lib/services/coupon.service'
-import { presetAddresses } from '@/lib/mock-data'
 import type { DeliveryAddress, DeliveryMethod, PaymentMethod } from '@/types'
+
+const presetAddresses: DeliveryAddress[] = [
+  {
+    id: 'addr-1',
+    name: 'Kofi Mensah',
+    phone: '+233 24 000 0000',
+    address: '14 Boundary Road, East Legon',
+    landmark: 'Beside the Total fuel station',
+    city: 'Accra',
+    isDefault: true,
+  },
+  {
+    id: 'addr-2',
+    name: 'Kofi Mensah',
+    phone: '+233 24 000 0000',
+    address: '43 Oxford Street',
+    landmark: 'Opposite the pharmacy',
+    city: 'Accra',
+  },
+]
 
 type FormStatus =
   | { kind: 'idle' }
@@ -160,6 +179,7 @@ export default function CheckoutPage() {
         paymentMethod,
         couponDiscount: discount,
         couponLabel: appliedCoupon?.label,
+        couponCode: appliedCoupon?.code,
       })
 
       if (paymentMethod === 'pay_on_delivery') {

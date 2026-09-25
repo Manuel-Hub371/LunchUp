@@ -1,8 +1,10 @@
 /**
  * Deals service — surfaces active food deals and vendor promotions.
+ * Backed by the LunchUp API (`GET /deals`).
  */
-import { withLatency } from './api'
-import { deals, getFoodById, getRestaurantById } from '@/lib/mock-data'
+import { apiRequest, request } from './api'
+import { foodService } from './food.service'
+import { restaurantService } from './restaurant.service'
 import type { Deal, Food } from '@/types'
 
 export interface DealWithFood extends Deal {
@@ -11,44 +13,64 @@ export interface DealWithFood extends Deal {
   vendorName: string
 }
 
+interface DealView {
+  id: string
+  discount: number
+  label: string
+  originalPrice: number
+  dealPrice: number
+  expiresAt: string
+  food: { id: string; name: string; image: string; restaurantId: string }
+  restaurant: { id: string; name: string; slug: string; location?: string; rating: number }
+}
+
+async function toDealWithFood(view: DealView): Promise<DealWithFood> {
+  const food = await foodService.getById(view.food.id)
+  return {
+    id: view.id,
+    foodId: view.food.id,
+    discount: view.discount,
+    originalPrice: view.originalPrice,
+    expiresAt: view.expiresAt,
+    vendorId: view.food.restaurantId,
+    label: view.label,
+    food: food || {
+      id: view.food.id,
+      name: view.food.name,
+      vendor: view.restaurant.name,
+      vendorId: view.food.restaurantId,
+      rating: view.restaurant.rating,
+      reviewCount: 0,
+      price: view.originalPrice,
+      deliveryTime: '30-45 min',
+      image: view.food.image,
+      discount: view.discount,
+      location: view.restaurant.location,
+      available: true,
+    },
+    salePrice: view.dealPrice,
+    vendorName: view.restaurant.name,
+  }
+}
+
 export const dealService = {
   async active(): Promise<DealWithFood[]> {
-    const now = Date.now()
-    const active: DealWithFood[] = []
-    for (const deal of deals) {
-      if (new Date(deal.expiresAt).getTime() < now) continue
-      const food = getFoodById(deal.foodId)
-      if (!food) continue
-      active.push({
-        ...deal,
-        food,
-        salePrice: Math.round(food.price * (1 - deal.discount / 100)),
-        vendorName: food.vendor,
-      })
-    }
-    return withLatency(active.sort((a, b) => b.discount - a.discount))
+    const envelope = await apiRequest<DealView[]>('/deals', { query: { page: 1, pageSize: 50 } })
+    const views = (envelope.data || []).sort((a, b) => b.discount - a.discount)
+    return Promise.all(views.map(toDealWithFood))
   },
 
   async vendorPromotions(): Promise<
     Array<{ vendorId: string; vendorName: string; label: string; discount: number }>
   > {
-    const items = [
-      '1',
-      '2',
-      '3',
-      '4',
-      '5',
-      '6',
-      '7',
-    ]
-      .map((id) => getRestaurantById(id))
-      .filter((restaurant) => restaurant?.promotion)
+    const result = await restaurantService.list({ hasDeals: true, pageSize: 50 })
+    return result.items
+      .filter((restaurant) => restaurant.promotion)
       .map((restaurant) => ({
-        vendorId: (restaurant as NonNullable<typeof restaurant>).id,
-        vendorName: (restaurant as NonNullable<typeof restaurant>).name,
-        label: (restaurant as NonNullable<typeof restaurant>).promotion?.label || '',
-        discount: (restaurant as NonNullable<typeof restaurant>).promotion?.discount || 0,
+        vendorId: restaurant.id,
+        vendorName: restaurant.name,
+        label: restaurant.promotion?.label || '',
+        discount: restaurant.promotion?.discount || 0,
       }))
-    return withLatency(items)
   },
 }

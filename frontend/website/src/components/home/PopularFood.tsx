@@ -2,13 +2,15 @@ import React from 'react'
 import Link from 'next/link'
 import { ArrowRight } from 'lucide-react'
 import FoodCard from '../cards/FoodCard'
-import { foods } from '@/lib/mock-data'
+import { foodService } from '@/lib/services/food.service'
 
-export default function PopularFood() {
-  const popularFoods = [...foods]
-    .filter((food) => !food.discount)
-    .sort((a, b) => (b.popularity || 0) - (a.popularity || 0))
-    .slice(0, 4)
+export default async function PopularFood() {
+  const popularFoods = await foodService
+    .list({ sort: 'popular', pageSize: 6 })
+    .then(({ items }) => items.filter((food) => !food.discount).slice(0, 4))
+    .catch(() => [])
+
+  if (popularFoods.length === 0) return null
 
   return (
     <section className="bg-white py-14 md:py-20 border-b border-border-warm/50">

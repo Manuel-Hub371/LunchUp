@@ -95,7 +95,13 @@ function PaymentPageContent() {
       return current
     })
     try {
-      const result = await paymentService.verifyPayment(paymentId as string)
+      const result = await paymentService.verifyPayment(paymentId as string, orderId || undefined)
+      if (result.retry) {
+        router.replace(`/payment?paymentId=${result.retry}&orderId=${orderId || ''}`)
+        setAttemptedVerify(true)
+        load()
+        return
+      }
       if (result.payment.status === 'success' && result.order) {
         clear()
         router.replace(`/order-confirmation?orderId=${result.order.id}`)
@@ -116,11 +122,11 @@ function PaymentPageContent() {
         message: error instanceof Error ? error.message : 'We could not verify your payment right now.',
       })
     }
-  }, [paymentId, clear, router])
+  }, [paymentId, orderId, clear, router, load])
 
   const cancelPayment = async () => {
     try {
-      await paymentService.cancelPayment(paymentId as string)
+      await paymentService.cancelPayment(paymentId as string, orderId || undefined)
       const order = (await orderService.getById(orderId || '')) as Order | null
       if (order) setPhase({ kind: 'cancelled', order })
       else setPhase({ kind: 'missing' })

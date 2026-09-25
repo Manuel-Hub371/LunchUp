@@ -245,6 +245,7 @@ export interface Order {
   estimatedDeliveryTime: string
   createdAt: string
   paymentId?: string
+  paymentReference?: string
   timeline: OrderTimelineEntry[]
 }
 

@@ -3,10 +3,11 @@ import Link from 'next/link'
 import { ArrowRight } from 'lucide-react'
 import RestaurantCard from '../cards/RestaurantCard'
 import { restaurantBadge } from '../restaurants/restaurantBadges'
-import { getFeaturedRestaurants } from '@/lib/mock-data'
+import { restaurantService } from '@/lib/services/restaurant.service'
 
-export default function FeaturedRestaurants() {
-  const featuredRestaurants = getFeaturedRestaurants(3)
+export default async function FeaturedRestaurants() {
+  const featuredRestaurants = await restaurantService.featured(3).catch(() => [])
+  if (featuredRestaurants.length === 0) return null
 
   return (
     <section className="bg-warm-50 py-14 md:py-20 border-b border-border-warm/50">

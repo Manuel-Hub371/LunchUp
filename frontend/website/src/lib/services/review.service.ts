@@ -1,21 +1,49 @@
 /**
- * Review service — lists and submits reviews for foods and vendors.
+ * Review service — lists and submits reviews.
+ * Backed by the LunchUp API (`GET/POST /reviews`).
  */
-import { guardedRequest, withLatency } from './api'
-import { getFoodReviews, getRestaurantReviews, reviews } from '@/lib/mock-data'
+import { apiRequest, request, ApiError } from './api'
 import type { Review } from '@/types'
-import { uid } from '@/lib/utils'
+
+interface ReviewView {
+  id: string
+  rating: number
+  comment: string | null
+  author: string
+  authorAvatar?: string
+  food?: string
+  createdAt: string
+}
+
+function toReview(view: ReviewView): Review {
+  return {
+    id: view.id,
+    customerName: view.author,
+    rating: view.rating,
+    comment: view.comment ?? '',
+    avatar: view.authorAvatar,
+    location: view.food,
+    createdAt: view.createdAt,
+  }
+}
 
 export const reviewService = {
   async forFood(foodId: string): Promise<Review[]> {
-    return withLatency(getFoodReviews(foodId))
+    try {
+      const envelope = await apiRequest<ReviewView[]>('/reviews', {
+        query: { restaurantId: foodId, page: 1, pageSize: 50 },
+      })
+      return (envelope.data || []).map(toReview)
+    } catch {
+      return []
+    }
   },
 
   async forVendor(vendorId: string): Promise<Review[]> {
-    const subjectReviews = getRestaurantReviews(vendorId)
-    const merged = [...subjectReviews, ...reviews.slice(0, 2)]
-    const unique = Array.from(new Map(merged.map((review) => [review.id, review])).values())
-    return withLatency(unique)
+    const envelope = await apiRequest<ReviewView[]>('/reviews', {
+      query: { restaurantId: vendorId, page: 1, pageSize: 50 },
+    })
+    return (envelope.data || []).map(toReview)
   },
 
   async submit(input: {
@@ -25,13 +53,17 @@ export const reviewService = {
     rating: number
     comment: string
   }): Promise<Review> {
-    const review: Review = {
-      id: uid('review'),
-      customerName: input.customerName || 'LunchUp Customer',
-      rating: input.rating,
-      comment: input.comment,
-      createdAt: new Date().toISOString().slice(0, 10),
+    if (!input.comment.trim()) {
+      throw new ApiError('Please add a short comment.', 422)
     }
-    return guardedRequest(review, () => !input.comment.trim(), 'Please add a short comment.')
+    const review = await request<ReviewView>('/reviews', {
+      method: 'POST',
+      body: {
+        restaurantId: input.targetId,
+        rating: input.rating,
+        comment: input.comment,
+      },
+    })
+    return toReview(review)
   },
 }

@@ -1,170 +1,178 @@
 /**
- * Payment architecture.
+ * Payment service.
  *
- * UI components never decide whether a payment succeeded. Payment flows
- * through an initiated → pending → verified lifecycle driven by a payment
- * provider. This module implements the provider adapter contract so a real
- * provider (Mobile Money gateway, card processor) can be dropped in later
- * without touching checkout UI.
+ * UI components never decide whether a payment succeeded; the LunchUp API
+ * owns the provider lifecycle. This module adapts checkout + the payment
+ * page to `/payments/initiate` and `/payments/verify`.
  *
- * The development provider simulates the full lifecycle and is clearly not
- * a production payment processor.
+ * A lightweight in-memory index keyed by `paymentId` preserves the session
+ * across the client-side navigation from checkout to the payment page and
+ * enables an automatic retry when the previous attempt reached a terminal
+ * state. It is re-watered from the order whenever the page loads.
  */
-import { withLatency, ApiError } from '@/lib/services/api'
-import { orderService } from '@/lib/orders/order.service'
-import { uid } from '@/lib/utils'
-import type { Order, Payment, PaymentMethod, PaymentStatus } from '@/types'
+import { ApiError, request } from '@/lib/services/api'
+import { orderService, toOrder, type OrderView } from '@/lib/orders/order.service'
+import type { Order, Payment, PaymentMethod } from '@/types'
 
-/* ---------------------- Provider contract ----------------------- */
+interface InitiatedPayment {
+  paymentId: string
+  orderId: string
+  reference: string
+  method: PaymentMethod
+  amount: number
+}
 
-export interface PaymentInitiation {
+const initiatedByPaymentId = new Map<string, InitiatedPayment>()
+
+interface InitiateResponse {
+  paymentId: string
+  orderId: string
   reference: string
   provider: string
-  status: PaymentStatus
-  instructions?: string
+  requiresVerification: boolean
+  status: string
 }
 
-export interface PaymentProvider {
-  /** Starts a payment with the provider. Always begins in `pending`. */
-  initiate(input: { amount: number; method: PaymentMethod; account?: string }): Promise<PaymentInitiation>
-  /** Asks the provider for the authoritative result of a payment. */
-  verify(reference: string): Promise<Exclude<PaymentStatus, 'pending'>>
+interface VerifyResponse {
+  orderId: string
+  paymentId: string
+  status: 'success' | 'failed'
+  message?: string
+  order?: OrderView
 }
 
-/* --------------------- Development provider ---------------------- */
-
-/**
- * Development provider.
- *
- * Deterministic simulation:
- * - Payments initiated with an account whose last 4 digits are "0000" fail.
- * - Everything else succeeds on the first verification.
- * - Provider responses are authoritative here — the UI just reflects them.
- */
-export const devPaymentOutcome: { mode: 'success' | 'fail' | 'expire' } = { mode: 'success' }
-
-const referenceAccounts = new Map<string, string>()
-
-function simulateProviderWork(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 900))
-}
-
-const DevPaymentProvider: PaymentProvider = {
-  async initiate({ amount, method, account }) {
-    await simulateProviderWork()
-    const reference = uid('PAY')
-    referenceAccounts.set(reference, account || '')
-    const instructions =
-      method === 'mobile_money'
-        ? 'Confirm the payment prompt on your phone to authorize the charge.'
-        : 'Complete the secure card checkout to authorize the charge.'
-    return { reference, provider: 'dev-shell', status: 'pending', instructions }
-  },
-
-  async verify(reference) {
-    await simulateProviderWork()
-    if (devPaymentOutcome.mode === 'expire') {
-      referenceAccounts.delete(reference)
-      return 'expired'
-    }
-    if (devPaymentOutcome.mode === 'fail') {
-      referenceAccounts.delete(reference)
-      return 'failed'
-    }
-    const account = referenceAccounts.get(reference) || ''
-    referenceAccounts.delete(reference)
-    return account.slice(-4) === '0000' ? 'failed' : 'success'
-  },
-}
-
-/* ------------------------- Payment service ------------------------ */
-
-const PAYMENTS_KEY = 'lunchup.payments.v1'
-
-function readPayments(): Payment[] {
-  try {
-    const raw = localStorage.getItem(PAYMENTS_KEY)
-    return raw ? (JSON.parse(raw) as Payment[]) : []
-  } catch {
-    return []
+function toPayment(paymentId: string, base: InitiatedPayment): Payment {
+  return {
+    id: paymentId,
+    orderId: base.orderId,
+    method: base.method,
+    amount: base.amount,
+    status: 'pending',
+    reference: base.reference,
+    createdAt: new Date().toISOString(),
   }
 }
 
-function writePayments(payments: Payment[]): void {
-  try {
-    localStorage.setItem(PAYMENTS_KEY, JSON.stringify(payments))
-  } catch {
-    /* storage unavailable */
-  }
+function statusFor(raw: string): Payment['status'] {
+  const normalized = (raw || '').toLowerCase()
+  if (normalized === 'success') return 'success'
+  if (normalized === 'failed') return 'failed'
+  if (normalized === 'expired') return 'expired'
+  if (normalized === 'cancelled') return 'cancelled'
+  return 'pending'
 }
 
 export const paymentService = {
-  provider: DevPaymentProvider,
-
   async createPayment(order: Order, method: PaymentMethod, account?: string): Promise<Payment> {
     if (method === 'pay_on_delivery') {
       throw new ApiError('Pay-on-delivery orders do not require a payment.', 422)
     }
-    await withLatency(null)
-    const items = readPayments()
-    const existing = items.find((payment) => payment.orderId === order.id)
-    if (existing && existing.status === 'pending') return existing
-
-    const initiation = await this.provider.initiate({ amount: order.total, method, account })
-    const payment: Payment = {
-      id: uid('payment'),
-      orderId: order.id,
+    const details = method === 'mobile_money' ? { accountNumber: account } : { cardLast4: account }
+    const init = await request<InitiateResponse>('/payments/initiate', {
+      method: 'POST',
+      body: { orderId: order.id, method, details },
+    })
+    const base: InitiatedPayment = {
+      paymentId: init.paymentId,
+      orderId: init.orderId,
+      reference: init.reference,
       method,
       amount: order.total,
-      status: initiation.status,
-      reference: initiation.reference,
-      createdAt: new Date().toISOString(),
     }
-    items.push(payment)
-    writePayments(items)
-    return payment
+    initiatedByPaymentId.set(init.paymentId, base)
+    return toPayment(init.paymentId, base)
   },
 
   /**
-   * Verifies a payment with the provider and only marks the order paid when
-   * the provider confirms success. On success the order is advanced to
-   * `confirmed`.
+   * Verifies a payment and only reflects the result the API reports. On
+   * success the order is returned with payment confirmed. When the previous
+   * attempt reached a terminal state the service starts a fresh payment on
+   * the same order (server-side) and surfaces `retry` so the page can adopt
+   * the new payment id.
    */
-  async verifyPayment(paymentId: string): Promise<{ payment: Payment; order?: Order }> {
-    await withLatency(null, 400)
-    const payments = readPayments()
-    const payment = payments.find((item) => item.id === paymentId)
-    if (!payment) throw new ApiError('Payment not found.', 404)
-
-    const outcome = await this.provider.verify(payment.reference)
-    payment.status = outcome
-    payment.updatedAt = new Date().toISOString()
-    writePayments(payments)
-
-    if (outcome === 'success') {
-      const order = await orderService.confirmOrder(payment.orderId)
-      return { payment, order: order || undefined }
+  async verifyPayment(paymentId: string, orderId?: string): Promise<{
+    payment: Payment
+    order?: Order
+    retry?: string
+  }> {
+    const entry = initiatedByPaymentId.get(paymentId)
+    const resolvedOrderId = entry?.orderId || orderId
+    if (!resolvedOrderId) {
+      throw new ApiError('Payment session not found. Please start again.', 404, 'PAYMENT_SESSION_NOT_FOUND')
     }
-    return { payment }
+
+    let result: VerifyResponse
+    try {
+      result = await request<VerifyResponse>('/payments/verify', {
+        method: 'POST',
+        body: { orderId: resolvedOrderId, reference: entry?.reference },
+      })
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409 && entry) {
+        const fresh = await request<InitiateResponse>('/payments/initiate', {
+          method: 'POST',
+          body: { orderId: entry.orderId, method: entry.method, details: {} },
+        })
+        const base: InitiatedPayment = {
+          paymentId: fresh.paymentId,
+          orderId: entry.orderId,
+          reference: fresh.reference,
+          method: entry.method,
+          amount: entry.amount,
+        }
+        initiatedByPaymentId.set(fresh.paymentId, base)
+        const order = await orderService.getById(entry.orderId)
+        return { payment: toPayment(fresh.paymentId, base), order: order || undefined, retry: fresh.paymentId }
+      }
+      throw error
+    }
+
+    const order = result.order ? toOrder(result.order) : ((await orderService.getById(result.orderId)) ?? undefined)
+    const payment: Payment = {
+      id: result.paymentId,
+      orderId: result.orderId,
+      method: entry?.method ?? order?.paymentMethod ?? 'mobile_money',
+      amount: entry?.amount ?? order?.total ?? 0,
+      status: statusFor(result.status),
+      reference: entry?.reference ?? '',
+      createdAt: new Date().toISOString(),
+    }
+    if (result.status === 'success') {
+      initiatedByPaymentId.delete(paymentId)
+    }
+    return { payment, order }
   },
 
-  async getByOrder(orderId: string): Promise<Payment | null> {
-    await withLatency(null)
-    return readPayments().find((payment) => payment.orderId === orderId) || null
+  /** Rebuilds the payment session from the order's stored payment row. */
+  async getByOrder(orderIdOrPaymentId: string): Promise<Payment | null> {
+    const order = await orderService.getById(orderIdOrPaymentId)
+    if (!order || !order.paymentId) return null
+    const base: InitiatedPayment = {
+      paymentId: order.paymentId,
+      orderId: order.id,
+      reference: order.paymentReference ?? '',
+      method: order.paymentMethod,
+      amount: order.total,
+    }
+    initiatedByPaymentId.set(order.paymentId, base)
+    return {
+      id: order.paymentId,
+      orderId: order.id,
+      method: order.paymentMethod,
+      amount: order.total,
+      status: statusFor(order.paymentStatus),
+      reference: order.paymentReference ?? '',
+      createdAt: order.createdAt,
+    }
   },
 
   /** Customer-initiated cancellation. Also cancels the related order. */
-  async cancelPayment(paymentId: string): Promise<boolean> {
-    await withLatency(null)
-    const payments = readPayments()
-    const payment = payments.find((item) => item.id === paymentId)
-    if (!payment || payment.status === 'success' || payment.status === 'failed' || payment.status === 'expired') {
-      return false
-    }
-    payment.status = 'cancelled'
-    payment.updatedAt = new Date().toISOString()
-    writePayments(payments)
-    await orderService.markCancelled(payment.orderId)
-    return true
+  async cancelPayment(paymentId: string, orderId?: string): Promise<boolean> {
+    const entry = initiatedByPaymentId.get(paymentId)
+    const resolvedOrderId = entry?.orderId || orderId
+    if (!resolvedOrderId) return false
+    const cancelled = await orderService.markCancelled(resolvedOrderId)
+    initiatedByPaymentId.delete(paymentId)
+    return Boolean(cancelled)
   },
 }

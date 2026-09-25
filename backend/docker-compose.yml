@@ -1,0 +1,61 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: lunchup-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: lunchup
+    ports:
+      - '5432:5432'
+    volumes:
+      - lunchup_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: lunchup-redis
+    restart: unless-stopped
+    ports:
+      - '6379:6379'
+    volumes:
+      - lunchup_redisdata:/data
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lunchup-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      FRONTEND_URL: http://localhost:3000
+      API_URL: http://localhost:4000
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/lunchup?schema=public
+      REDIS_URL: redis://redis:6379
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-change-me-access-secret-32-chars-minimum}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-change-me-refresh-secret-32-chars-minimum}
+      JWT_ACCESS_TTL: 15m
+      JWT_REFRESH_TTL: 30d
+      CLOUDINARY_URL: ${CLOUDINARY_URL:-}
+      LOG_LEVEL: info
+    ports:
+      - '4000:4000'
+    volumes:
+      - lunchup_uploads:/app/uploads
+
+volumes:
+  lunchup_pgdata:
+  lunchup_redisdata:
+  lunchup_uploads:

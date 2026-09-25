@@ -1,6 +1,6 @@
 import Image from 'next/image'
 import { Smartphone } from 'lucide-react'
-import { appStoreLinks } from '@/lib/mock-data'
+import { appStoreLinks } from '@/lib/services/app-links'
 
 export default function DownloadAppCTA() {
   return (

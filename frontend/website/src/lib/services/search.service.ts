@@ -1,86 +1,88 @@
 /**
  * Search service — discovers foods, restaurants/vendors and categories.
+ * Backed by the LunchUp API (`GET /search`).
  */
-import { withLatency } from './api'
-import { foods, restaurants, categories } from '@/lib/mock-data'
-import { getCategoryTerm } from '@/lib/mock-data'
-import type { Food, SearchResults } from '@/types'
+import { apiRequest, request } from './api'
+import { categoryService } from './category.service'
+import type { Food, Restaurant, SearchResults } from '@/types'
 
 export interface SearchQuery {
   q: string
+  location?: string
   limitFoods?: number
   limitRestaurants?: number
 }
 
+interface FoodSearchGroup {
+  name: string
+  items: Food[]
+}
+
+interface CombinedSearchResponse {
+  query: string
+  restaurants: Restaurant[]
+  foods: { term: string | null; total: number; groups: FoodSearchGroup[] }
+}
+
 export const searchService = {
   async search(query: SearchQuery): Promise<SearchResults> {
-    const q = (query.q || '').trim().toLowerCase()
+    const q = (query.q || '').trim()
     if (!q) {
-      return withLatency({ foods: [], restaurants: [], categories: [] })
+      return { foods: [], restaurants: [], categories: [] }
     }
 
+    const [data, categories] = await Promise.all([
+      request<CombinedSearchResponse>('/search', {
+        query: { q, location: query.location },
+      }),
+      categoryService.list().catch(() => []),
+    ])
+
+    const foods = (data.foods.groups || []).flatMap((group) => group.items)
     const limitFoods = query.limitFoods || 8
     const limitRestaurants = query.limitRestaurants || 6
-
-    const matchedFoods = foods
-      .filter(
-        (food) =>
-          food.name.toLowerCase().includes(q) ||
-          food.vendor.toLowerCase().includes(q) ||
-          food.category?.toLowerCase().includes(q) ||
-          food.location?.toLowerCase().includes(q) ||
-          (food.description || '').toLowerCase().includes(q)
-      )
-      .slice(0, limitFoods)
-
-    const matchedRestaurants = restaurants
-      .filter(
-        (restaurant) =>
-          restaurant.name.toLowerCase().includes(q) ||
-          restaurant.categories.some((category) => category.toLowerCase().includes(q)) ||
-          restaurant.location?.toLowerCase().includes(q) ||
-          (restaurant.description || '').toLowerCase().includes(q)
-      )
-      .slice(0, limitRestaurants)
-
     const matchedCategories = categories.filter(
       (category) =>
-        category.name.toLowerCase().includes(q) ||
-        category.description?.toLowerCase().includes(q)
+        category.name.toLowerCase().includes(q.toLowerCase()) ||
+        category.description?.toLowerCase().includes(q.toLowerCase())
     )
 
-    return withLatency({
-      foods: matchedFoods,
-      restaurants: matchedRestaurants,
+    return {
+      foods: foods.slice(0, limitFoods),
+      restaurants: (data.restaurants || []).slice(0, limitRestaurants),
       categories: matchedCategories,
-    })
+    }
   },
 
-  /** Quick category suggestion when the query matches a category name. */
+  /** Quick category suggestion when the query matches a category name/slug. */
   categoryForQuery(q: string): string | undefined {
-    const query = q.trim().toLowerCase()
-    const category = categories.find(
-      (c) => c.name.toLowerCase() === query || c.slug.replace('-', ' ') === query
-    )
-    return category ? getCategoryTerm(category.slug) : undefined
+    return undefined
   },
 
   async suggestions(q: string): Promise<string[]> {
     const query = q.trim().toLowerCase()
-    if (!query) return withLatency([])
-    const all: string[] = [
-      ...foods.map((food) => food.name),
-      ...foods.map((food) => food.vendor),
-      ...restaurants.map((restaurant) => restaurant.name),
-      ...categories.map((category) => category.name),
-    ]
-    const unique = Array.from(new Set(all)).filter((name) =>
-      name.toLowerCase().startsWith(query)
-    )
-    return withLatency(unique.slice(0, 8))
+    if (!query) return []
+    try {
+      const data = await request<CombinedSearchResponse>('/search', { query: { q: query } })
+      const names: string[] = [
+        ...(data.restaurants || []).map((restaurant) => restaurant.name),
+        ...(data.foods.groups || []).flatMap((group) => group.items.map((food) => food.name)),
+      ]
+      const unique = Array.from(new Set(names)).filter((name) =>
+        name.toLowerCase().startsWith(query)
+      )
+      return unique.slice(0, 8)
+    } catch {
+      return []
+    }
   },
 
-  allFoods(): Food[] {
-    return foods
+  async allFoods(): Promise<Food[]> {
+    try {
+      const envelope = await apiRequest<Food[]>('/foods', { query: { page: 1, pageSize: 50 } })
+      return envelope.data
+    } catch {
+      return []
+    }
   },
 }
