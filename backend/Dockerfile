@@ -19,14 +19,15 @@ ENV NODE_ENV=production
 WORKDIR /app
 
 COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev || npm install --omit=dev
+# Keep the full dependency set so `prisma` CLI is available at runtime
+RUN npm ci || npm install
 
-COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
 COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/prisma ./prisma
+COPY prisma ./prisma
 
+RUN npx prisma generate
 RUN mkdir -p uploads
 
 EXPOSE 4000
 
-CMD ["node", "dist/main.js"]
+CMD ["sh", "-c", "npx prisma migrate deploy && node dist/main.js"]
